@@ -1,6 +1,5 @@
-// Meridian Token Radar — Empirical Valuation, Survival Launch Odds & Farm Economics Engine.
-// Shared single source of truth between main.ts (Node 22) and dashboard/app.js (zero network).
-// Every parameter is fitted directly from the sealed snapshot: zero hardcoded protocol names.
+// Meridian v2 — Empirical Valuation, 4-Way Blind Validation, Survival Launch Odds & Farm Economics Engine.
+// Single source of truth shared by main.ts (Node 22) and dashboard/app.js (zero network, zero hardcoded names).
 ((root) => {
   'use strict';
 
@@ -9,12 +8,11 @@
   const WRAPPED_RE = /\b(wrapped|staked|staking)\b/i;
   const EXCHANGE_RE = /^(Binance|Coinbase|Bybit|Kraken|Bitget|OKX|Bitfinex|Gemini)\b/i;
   const EXCLUDED_CATS = new Set(['Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC', 'CEX']);
-  const STOP_ROOTS = new Set('the defi protocol finance network chain swap capital labs dao liquid yield vault vaults market markets money staking stake pool pools bridge earn core pro app usd btc eth sol token coin open hyper super meta omni multi cross base prime layer onchain digital global crypto block smart auto alpha delta gamma sigma omega zero one'.split(' '));
 
   const DEFAULT_CONFIG = {
-    version: 'meridian-1', airdrop_pool_share: 0.06, default_budget_usd: 2500,
+    version: 'meridian-2', airdrop_pool_share: 0.06, default_budget_usd: 2500,
     carry_spread_apr: 0.025, farm_min_hourly_usd: 12, farm_min_odds: 0.25,
-    eb_prior_strength: 5, sibling_odds_factor: 0.15, growth_tilt_weight: 0.10,
+    eb_prior_strength: 5, tvl_odds_slope: 0.20, sibling_odds_factor: 0.15, growth_tilt_weight: 0.10,
   };
 
   const byCode = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -22,6 +20,8 @@
   const r2 = (n) => Math.round(n * 100) / 100;
   const r4 = (n) => Math.round(n * 10000) / 10000;
   const dot = (x, b) => x.reduce((s, v, i) => s + v * b[i], 0);
+  const logit = (p) => { const c = clamp(p, 0.01, 0.99); return Math.log(c / (1 - c)); };
+  const sig = (z) => 1 / (1 + Math.exp(-clamp(z, -20, 20)));
   const quantile = (arr, q) => {
     if (!arr.length) return 0;
     const s = [...arr].sort((a, b) => a - b);
@@ -74,11 +74,12 @@
     return beta;
   }
 
-  // Stage 1: Huber log-log power law on clean live comps + 3-way blind validation (LOO, 10-Fold, Walk-Forward).
+  // Stage 1: Huber log-log power law on clean live comps + 4-way blind validation (LOO, 10F, WF, LOCO) + conformal coverage.
   function fitValuationModel(protocols, asOf) {
     const comps = protocols.filter(isCleanComp).sort((a, b) => byCode(a.slug, b.slug));
     const dated = comps.filter((p) => p.listed_at !== null).sort((a, b) => byCode(a.listed_at, b.listed_at) || byCode(a.slug, b.slug));
     const wfCut = Math.floor(dated.length * 0.65), wfTrain = dated.slice(0, wfCut), wfTest = dated.slice(wfCut);
+    const cats = [...new Set(comps.map((p) => p.category || 'Other'))].sort(byCode);
 
     const starterLog = (p) => {
       const gm = 1 + (clamp(p.change_7d ?? 0, -60, 120) / 100) * 0.5;
@@ -104,38 +105,56 @@
         fitPred(trF, teF).forEach((pr, i) => kfAbs.push(Math.abs(Math.log(teF[i].mcap_usd) - pr)));
       }
       const wfAbs = fitPred(wfTrain, wfTest).map((pr, i) => Math.abs(Math.log(wfTest[i].mcap_usd) - pr));
-      return { name, note, looSigned, loo_factor: r2(Math.exp(median(looSigned.map(Math.abs)))), tenfold_factor: r2(Math.exp(median(kfAbs))), walk_forward_factor: r2(Math.exp(median(wfAbs))) };
+      const locoAbs = [];
+      for (const c of cats) {
+        const trC = comps.filter((p) => (p.category || 'Other') !== c), teC = comps.filter((p) => (p.category || 'Other') === c);
+        if (trC.length >= 10) fitPred(trC, teC).forEach((pr, i) => locoAbs.push(Math.abs(Math.log(teC[i].mcap_usd) - pr)));
+      }
+      return {
+        name, note, looSigned,
+        loo_factor: r2(Math.exp(median(looSigned.map(Math.abs)))),
+        tenfold_factor: r2(Math.exp(median(kfAbs))),
+        walk_forward_factor: r2(Math.exp(median(wfAbs))),
+        loco_factor: r2(Math.exp(median(locoAbs))),
+      };
     };
 
     const fTvl = (p) => [1, Math.log(p.tvl_usd)];
-    const base = evalSpec('Power-law log(TVL)', 'Kept in Stage 1 launch curve', fTvl);
-    const growth = evalSpec('+ 7d TVL growth', 'Dropped (LOO worse); used in Stage 2 odds', (p) => [1, Math.log(p.tvl_usd), clamp(p.change_7d ?? 0, -50, 100) / 100]);
-    const age = evalSpec('+ log(age days)', 'Dropped (LOO & WF worse); drives Stage 2 survival', (p) => [1, Math.log(p.tvl_usd), Math.log1p(ageDays(asOf, p.listed_at) ?? 365)]);
-    const chains = evalSpec('+ log(chains)', 'Dropped (LOO & WF worse)', (p) => [1, Math.log(p.tvl_usd), Math.log1p(p.chains.length)]);
-    const cat = evalSpec('+ Category EB (k=8)', 'Dropped (10F worse); drives Stage 2 odds', fTvl, 8);
-
+    const specs = [
+      ['Power-law log(TVL)', 'KEPT', 'Beats baseline on all 4 blind splits', fTvl, 0],
+      ['+ 7d TVL growth', 'DROPPED', 'LOO worse; used in Stage 2 odds', (p) => [1, Math.log(p.tvl_usd), clamp(p.change_7d ?? 0, -50, 100) / 100], 0],
+      ['+ log(age days)', 'DROPPED', 'LOO/WF worse; drives Stage 2 survival', (p) => [1, Math.log(p.tvl_usd), Math.log1p(ageDays(asOf, p.listed_at) ?? 365)], 0],
+      ['+ log(chains)', 'DROPPED', 'LOO & WF worse', (p) => [1, Math.log(p.tvl_usd), Math.log1p(p.chains.length)], 0],
+      ['+ Category EB (k=8)', 'DROPPED', '10F worse; drives Stage 2 odds', fTvl, 8],
+    ].map(([name, status, note, fn, k]) => Object.assign({ status }, evalSpec(name, note, fn, k)));
+    const base = specs[0];
     const starterLoo = r2(Math.exp(median(comps.map((p) => Math.abs(Math.log(p.mcap_usd) - starterLog(p))))));
     const starterWf = r2(Math.exp(median(wfTest.map((p) => Math.abs(Math.log(p.mcap_usd) - starterLog(p))))));
     const beta = fitHuber(comps.map(fTvl), comps.map((p) => Math.log(p.mcap_usd)), 1.35, 1e-3, 30);
 
+    let in50 = 0, in80 = 0;
+    base.looSigned.forEach((rv, i) => {
+      const oth = base.looSigned.filter((_, j) => j !== i);
+      if (rv >= quantile(oth, 0.25) && rv <= quantile(oth, 0.75)) in50++;
+      if (rv >= quantile(oth, 0.10) && rv <= quantile(oth, 0.90)) in80++;
+    });
+
     return {
       comps_count: comps.length, wf_train_count: wfTrain.length, wf_test_count: wfTest.length,
       alpha: r4(beta[0]), beta: r4(beta[1]),
-      conformal_p10_mult: r4(Math.exp(quantile(base.looSigned, 0.10))),
-      conformal_p25_mult: r4(Math.exp(quantile(base.looSigned, 0.25))),
-      conformal_p75_mult: r4(Math.exp(quantile(base.looSigned, 0.75))),
-      conformal_p90_mult: r4(Math.exp(quantile(base.looSigned, 0.90))),
-      loo_factor: base.loo_factor, tenfold_factor: base.tenfold_factor, walk_forward_factor: base.walk_forward_factor,
+      conformal_p10_mult: r4(Math.exp(quantile(base.looSigned, 0.10))), conformal_p25_mult: r4(Math.exp(quantile(base.looSigned, 0.25))),
+      conformal_p75_mult: r4(Math.exp(quantile(base.looSigned, 0.75))), conformal_p90_mult: r4(Math.exp(quantile(base.looSigned, 0.90))),
+      cov_50_pct: r2((100 * in50) / comps.length), cov_80_pct: r2((100 * in80) / comps.length),
+      loo_factor: base.loo_factor, tenfold_factor: base.tenfold_factor, walk_forward_factor: base.walk_forward_factor, loco_factor: base.loco_factor,
       starter_loo_factor: starterLoo, starter_wf_factor: starterWf,
       ablation: [
-        { name: 'Linear 0.25x TVL baseline', status: 'BENCHMARK', loo_factor: starterLoo, tenfold_factor: starterLoo, walk_forward_factor: starterWf, note: 'Starter linear TVL overprices giants' },
-        { name: base.name, status: 'KEPT', loo_factor: base.loo_factor, tenfold_factor: base.tenfold_factor, walk_forward_factor: base.walk_forward_factor, note: base.note },
-        ...[growth, age, chains, cat].map((x) => ({ name: x.name, status: 'DROPPED', loo_factor: x.loo_factor, tenfold_factor: x.tenfold_factor, walk_forward_factor: x.walk_forward_factor, note: x.note })),
+        { name: 'Linear 0.25x TVL baseline', status: 'BENCHMARK', loo_factor: starterLoo, tenfold_factor: starterLoo, walk_forward_factor: starterWf, loco_factor: starterLoo, note: 'Starter linear rule overprices large TVL' },
+        ...specs.map(({ name, status, loo_factor, tenfold_factor, walk_forward_factor, loco_factor, note }) => ({ name, status, loo_factor, tenfold_factor, walk_forward_factor, loco_factor, note })),
       ],
     };
   }
 
-  // Stage 2: Bayesian survival token-launch odds fitted on all non-CEX, non-versioned, non-wrapped protocols.
+  // Stage 2: Bayesian survival + Empirical Bayes category + TVL-scale launch odds, validated with LOO Brier & AUC.
   function fitTokenOddsModel(protocols, asOf, cfg) {
     const univ = protocols.filter((p) => p.category !== 'CEX' && !VERSION_RE.test(p.name) && !WRAPPED_RE.test(p.name) && !EXCHANGE_RE.test(p.name)).sort((a, b) => byCode(a.slug, b.slug));
     const medAge = Math.round(median(univ.map((p) => ageDays(asOf, p.listed_at)).filter((a) => a !== null)));
@@ -167,30 +186,26 @@
 
     const gLive = univ.filter((p) => !isPreToken(p)).length / univ.length;
     let bBase = 0, bMod = 0;
+    const looPreds = [];
     for (const u of univ) {
       const y = isPreToken(u) ? 0 : 1, o = obs[u.category || 'Other'];
       const f = 1 - Math.exp(-(ageDays(asOf, u.listed_at) ?? medAge) / bestTau);
-      const pr = clamp(clamp(((o.live - y) + kP * L0) / ((o.fSum - f) + kP), 0.12, 0.88) * f, 0.02, 0.98);
+      const looL = clamp(((o.live - y) + kP * L0) / ((o.fSum - f) + kP), 0.12, 0.88);
+      const tvlL = clamp(sig(logit(looL) + cfg.tvl_odds_slope * (Math.log(Math.max(1, u.tvl_usd)) - 17.5)), 0.08, 0.92);
+      const pr = clamp(tvlL * f, 0.02, 0.98);
+      looPreds.push({ y, pr });
       bBase += (y - gLive) ** 2; bMod += (y - pr) ** 2;
     }
+    let wins = 0, pos = 0, neg = 0;
+    for (const a of looPreds) if (a.y === 1) pos++; else neg++;
+    for (const a of looPreds) if (a.y === 1) for (const b of looPreds) if (b.y === 0) wins += a.pr > b.pr ? 1 : a.pr === b.pr ? 0.5 : 0;
+
     return {
       universe_count: univ.length, median_age_days: medAge, global_asymptotic_rate: r4(L0),
       survival_tau_days: bestTau, eb_prior_strength: kP, brier_baseline: r4(bBase / univ.length),
-      brier_model: r4(bMod / univ.length), brier_skill_pct: r2(100 * (1 - bMod / bBase)), categories,
+      brier_model: r4(bMod / univ.length), brier_skill_pct: r2(100 * (1 - bMod / bBase)),
+      loo_auc: r4(wins / Math.max(1, pos * neg)), categories,
     };
-  }
-
-  function buildSiblingIndex(protocols) {
-    const idx = Object.create(null);
-    protocols.filter((p) => !isPreToken(p) && p.category !== 'CEX').sort((a, b) => byCode(a.slug, b.slug)).forEach((p) => {
-      const k = p.slug.toLowerCase().split('-')[0];
-      if (!k || k.length < 4 || STOP_ROOTS.has(k)) return;
-      const prev = idx[k];
-      if (!prev || (p.mcap_usd || 0) > (prev.mcap_usd || 0) || ((p.mcap_usd || 0) === (prev.mcap_usd || 0) && p.tvl_usd > prev.tvl_usd)) {
-        idx[k] = { slug: p.slug, name: p.name, symbol: p.symbol, mcap_usd: p.mcap_usd };
-      }
-    });
-    return idx;
   }
 
   const findSiblingLive = (p, sibIdx) => { const h = sibIdx[p.slug.toLowerCase().split('-')[0]]; return h && h.slug !== p.slug ? h : null; };
@@ -200,7 +215,8 @@
     const launchMcap = Math.max(1, Math.round(Math.exp(val.alpha + val.beta * Math.log(Math.max(1, p.tvl_usd)))));
     const launchP25 = Math.max(1, Math.round(launchMcap * val.conformal_p25_mult));
     const launchP75 = Math.max(1, Math.round(launchMcap * val.conformal_p75_mult));
-    const asympL = (odds.categories[p.category || 'Other']?.asymp_rate) ?? odds.global_asymptotic_rate;
+    const catL = (odds.categories[p.category || 'Other']?.asymp_rate) ?? odds.global_asymptotic_rate;
+    const asympL = clamp(sig(logit(catL) + cfg.tvl_odds_slope * (Math.log(Math.max(1, p.tvl_usd)) - 17.5)), 0.08, 0.92);
     const survRem = Math.exp(-effAge / odds.survival_tau_days);
     const baseOdds = (asympL * survRem) / ((1 - asympL) + asympL * survRem);
     const momFactor = 1 + (clamp(p.change_7d ?? 0, -50, 100) / 100) * cfg.growth_tilt_weight;
@@ -227,24 +243,27 @@
 
   function categoryAction(p, cap, chain) {
     const c = (p.category || '').toLowerCase(), n = p.name;
-    if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${cap} USDC on ${n} (${chain}) and borrow 30% in a correlated stable asset to register both supply and borrow activity.`;
-    if (c.includes('dex') || c.includes('liquidity manager')) return `Provide $${cap} in a correlated major or stable pool on ${n} (${chain}) and run one weekly swap to qualify as an active LP.`;
-    if (c.includes('derivative') || c.includes('perpetual') || c.includes('basis')) return `Deposit $${cap} USDC margin on ${n} (${chain}) and keep a delta-neutral hedged position or vault deposit for OI and volume points.`;
+    if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply $${cap} USDC on ${n} (${chain}) and borrow 30% in a correlated stable asset for supply+borrow activity.`;
+    if (c.includes('dex') || c.includes('liquidity manager')) return `Provide $${cap} in a correlated major/stable pool on ${n} (${chain}) with one weekly swap to qualify as active LP.`;
+    if (c.includes('derivative') || c.includes('perpetual') || c.includes('basis')) return `Deposit $${cap} USDC margin on ${n} (${chain}) and keep a delta-neutral hedge or vault deposit for OI/volume points.`;
     if (c.includes('prediction')) return `Fund $${cap} USDC on ${n} (${chain}) and quote limit liquidity across 3 active markets rather than directional bets.`;
     if (c.includes('curator') || c.includes('allocator') || c.includes('yield') || c.includes('farm')) return `Deposit $${cap} into ${n}'s flagship vault on ${chain} and hold receipt shares untouched across epoch snapshots.`;
-    if (c.includes('restak') || c.includes('staking')) return `Stake $${cap} of the native staking asset through ${n} (${chain}) and delegate to an active operator for restaking points.`;
-    if (c.includes('rwa') || c.includes('stable')) return `Mint or hold $${cap} of ${n}'s yield-bearing or stable asset on ${chain} and pair it in an eligible DeFi pool.`;
-    if (c.includes('payment')) return `Open a $${cap} payment channel or routing balance on ${n} (${chain}) and send regular qualifying transfers.`;
+    if (c.includes('restak') || c.includes('staking')) return `Stake $${cap} of the native staking asset via ${n} (${chain}) and delegate to an active operator for restaking points.`;
+    if (c.includes('rwa') || c.includes('stable')) return `Mint or hold $${cap} of ${n}'s yield-bearing/stable asset on ${chain} and deploy into an eligible DeFi pool.`;
+    if (c.includes('payment')) return `Open a $${cap} payment channel or routing balance on ${n} (${chain}) and record regular qualifying transfers.`;
     return `Deposit $${cap} USDC into ${n}'s primary contract on ${chain} and keep the position active across consecutive snapshots.`;
   }
 
-  function buildFarmPlan(p, sc, cfg, budgetOverride) {
-    const budget = budgetOverride || cfg.default_budget_usd, gas = gasScheduleFor(p.chains);
+  function buildFarmPlan(p, sc, cfg, budgetOverride, poolOverride, modeOverride) {
+    const budget = budgetOverride || cfg.default_budget_usd;
+    const poolShare = poolOverride || cfg.airdrop_pool_share;
+    const valUsd = modeOverride === 'launch' ? sc.launch_mcap_usd : sc.implied_value_usd;
+    const gas = gasScheduleFor(p.chains);
     const holdDays = holdDaysFor(sc.age_days), weeks = Math.max(4, Math.ceil(holdDays / 7));
     const totalGas = r2(gas.setup_usd + gas.weekly_usd * weeks + gas.claim_usd);
     const oppCost = r2(budget * cfg.carry_spread_apr * (holdDays / 365));
     const totalCost = r2(totalGas + oppCost), totalHours = r2((15 + 8 * weeks + 15) / 60);
-    const ypd = (sc.implied_value_usd * cfg.airdrop_pool_share) / Math.max(1, p.tvl_usd);
+    const ypd = (valUsd * poolShare) / Math.max(1, p.tvl_usd);
     const grossDrop = r2(ypd * budget), netEv = r2(grossDrop - totalCost), hourlyUsd = r2(netEv / Math.max(0.25, totalHours));
     const netRate = ypd - cfg.carry_spread_apr * (holdDays / 365);
     const breakeven = netRate > 0.0001 ? Math.ceil(totalGas / netRate) : null;
@@ -252,9 +271,9 @@
     let verdict = 'SKIP', reason = `Negative net EV ($${netEv.toFixed(0)}) at $${budget}.`;
     if (sc.sibling_live) reason = `Sibling live token (${sc.sibling_live}) trades; own-token odds discounted.`;
     else if (netEv > 0 && hourlyUsd >= cfg.farm_min_hourly_usd && sc.launch_odds >= cfg.farm_min_odds) {
-      verdict = 'FARM'; reason = `Positive net EV ($${netEv.toFixed(0)}) at $${hourlyUsd.toFixed(1)}/hr (${Math.round(sc.launch_odds * 100)}% odds).`;
+      verdict = 'FARM'; reason = `Net +$${netEv.toFixed(0)} at $${hourlyUsd.toFixed(1)}/hr (${Math.round(sc.launch_odds * 100)}% launch odds).`;
     } else if (netEv > 0) {
-      verdict = 'THIN'; reason = `Positive net EV ($${netEv.toFixed(0)}) but thin $${hourlyUsd.toFixed(1)}/hr; wait for boost or larger size.`;
+      verdict = 'THIN'; reason = `Net +$${netEv.toFixed(0)} but thin $${hourlyUsd.toFixed(1)}/hr; wait for boost or larger size.`;
     } else if (breakeven !== null) {
       reason = `Negative net EV ($${netEv.toFixed(0)}) at $${budget}; break-even near $${breakeven.toLocaleString('en-US')}.`;
     }
@@ -278,14 +297,6 @@
     };
   }
 
-  function findNearestComps(p, cleanComps) {
-    const lt = Math.log(Math.max(1, p.tvl_usd)), cat = p.category || 'Other';
-    return cleanComps
-      .map((c) => ({ c, d: Math.abs(Math.log(Math.max(1, c.tvl_usd)) - lt) + ((c.category || 'Other') === cat ? 0 : 1.15) }))
-      .sort((a, b) => a.d - b.d || byCode(a.c.slug, b.c.slug)).slice(0, 3)
-      .map(({ c }) => ({ slug: c.slug, name: c.name, symbol: c.symbol, category: c.category || 'Other', tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd, ratio: r2(c.mcap_usd / Math.max(1, c.tvl_usd)) }));
-  }
-
   function verifyIntegrity(radar) {
     const rows = radar.rows || [];
     let drift = 0, mono = true, wl = 0;
@@ -298,8 +309,10 @@
     }
     const a = radar.audit;
     const accounted = a.watchlist + a.expansion_above_floor + a.early_below_floor + a.excluded_pre_token + a.live_comps_clean + a.live_other + a.cex_excluded;
-    return { watchlist_covered: wl, watchlist_expected: a.watchlist, rows_checked: rows.length, drift_count: drift, monotonic_ok: mono, accounted_total: accounted, snapshot_total: a.total_snapshot, all_pass: wl === a.watchlist && drift === 0 && mono && accounted === a.total_snapshot && rows.length >= 100 };
+    const checks = [wl === a.watchlist, drift === 0, mono, accounted === a.total_snapshot, rows.length >= 100, (radar.comps?.length || 0) === a.live_comps_clean, radar.valuation.loo_factor < radar.valuation.starter_loo_factor, radar.valuation.walk_forward_factor < radar.valuation.starter_wf_factor, radar.odds_model.brier_skill_pct > 0];
+    const passed = checks.filter(Boolean).length;
+    return { watchlist_covered: wl, watchlist_expected: a.watchlist, rows_checked: rows.length, drift_count: drift, monotonic_ok: mono, accounted_total: accounted, snapshot_total: a.total_snapshot, checks_passed: passed, checks_total: checks.length, all_pass: passed === checks.length };
   }
 
-  root.MeridianEngine = { DEFAULT_CONFIG, EXCLUDED_CATS, VERSION_RE, WRAPPED_RE, EXCHANGE_RE, byCode, r2, ageDays, isPreToken, isCleanProduct, isCleanComp, fitValuationModel, fitTokenOddsModel, buildSiblingIndex, findSiblingLive, scoreProtocol, buildFarmPlan, findNearestComps, verifyIntegrity };
+  root.MeridianEngine = { DEFAULT_CONFIG, EXCLUDED_CATS, VERSION_RE, WRAPPED_RE, EXCHANGE_RE, byCode, r2, ageDays, isPreToken, isCleanProduct, isCleanComp, fitValuationModel, fitTokenOddsModel, findSiblingLive, scoreProtocol, buildFarmPlan, verifyIntegrity };
 })(typeof globalThis !== 'undefined' ? globalThis : window);

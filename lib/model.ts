@@ -132,7 +132,7 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
 
   const val = E.fitValuationModel(protocols, snapshot.as_of);
   const odds = E.fitTokenOddsModel(protocols, snapshot.as_of, cfg);
-  const sibIdx = E.buildSiblingIndex(protocols);
+  const sibIdx = buildSiblingIndexLocal(protocols, E);
   const cleanComps = protocols.filter((p: SnapshotProtocol) => E.isCleanComp(p));
 
   const selected: { p: SnapshotProtocol; tier: 'watchlist' | 'expansion' | 'early' }[] = [];
@@ -172,7 +172,7 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
     .map(({ p, tier }) => {
       const sc = E.scoreProtocol(p, snapshot.as_of, val, odds, sibIdx, cfg);
       const fm = E.buildFarmPlan(p, sc, cfg, cfg.default_budget_usd);
-      const peers = E.findNearestComps(p, cleanComps);
+      const peers = findNearestCompsLocal(p, cleanComps, E);
       return { p, tier, sc, fm, peers };
     })
     .sort((a, b) => (b.sc.implied_value_usd - a.sc.implied_value_usd) || E.byCode(a.p.slug, b.p.slug));
@@ -210,7 +210,7 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
     farm_steps: fm.farm_steps,
   }));
 
-  const rows = scoredList.map(({ p, tier, sc, fm, peers }, i) => ({
+  const rowsBase = scoredList.map(({ p, tier, sc, fm, peers }, i) => ({
     rank: i + 1,
     slug: p.slug,
     name: p.name,
@@ -241,6 +241,9 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
     breakeven_capital_usd: fm.breakeven_capital_usd,
     peers,
   }));
+
+  const rankBands = computeRankIntervalsLocal(rowsBase);
+  const rows = rowsBase.map((r, i) => ({ ...r, rank_lo: rankBands[i]!.rank_lo, rank_hi: rankBands[i]!.rank_hi }));
 
   const compsOut = cleanComps
     .map((p: SnapshotProtocol) => ({
@@ -320,6 +323,45 @@ export function validateBoard(board: BoardRow[], snapshot: Snapshot): string | n
   const missingWl = snapshot.watchlist.filter((s) => !seen.has(s));
   if (missingWl.length > 0) return `missing ${missingWl.length} watchlist slugs: ${missingWl.slice(0, 5).join(', ')}`;
   return null;
+}
+
+const STOP_ROOTS = new Set('the defi protocol finance network chain swap capital labs dao liquid yield vault vaults market markets money staking stake pool pools bridge earn core pro app usd btc eth sol token coin open hyper super meta omni multi cross base prime layer onchain digital global crypto block smart auto alpha delta gamma sigma omega zero one'.split(' '));
+
+function buildSiblingIndexLocal(protocols: SnapshotProtocol[], E: EngineApi): Record<string, { slug: string; name: string; symbol: string | null; mcap_usd: number | null }> {
+  const idx: Record<string, { slug: string; name: string; symbol: string | null; mcap_usd: number | null }> = Object.create(null);
+  protocols
+    .filter((p) => !E.isPreToken(p) && p.category !== 'CEX')
+    .sort((a, b) => E.byCode(a.slug, b.slug))
+    .forEach((p) => {
+      const k = p.slug.toLowerCase().split('-')[0];
+      if (!k || k.length < 4 || STOP_ROOTS.has(k)) return;
+      const prev = idx[k];
+      if (!prev || (p.mcap_usd || 0) > (prev.mcap_usd || 0) || ((p.mcap_usd || 0) === (prev.mcap_usd || 0) && p.tvl_usd > (prev.mcap_usd || 0))) {
+        idx[k] = { slug: p.slug, name: p.name, symbol: p.symbol, mcap_usd: p.mcap_usd };
+      }
+    });
+  return idx;
+}
+
+function findNearestCompsLocal(p: SnapshotProtocol, cleanComps: SnapshotProtocol[], E: EngineApi) {
+  const lt = Math.log(Math.max(1, p.tvl_usd)), cat = p.category || 'Other';
+  return cleanComps
+    .map((c) => ({ c, d: Math.abs(Math.log(Math.max(1, c.tvl_usd)) - lt) + ((c.category || 'Other') === cat ? 0 : 1.15) }))
+    .sort((a, b) => a.d - b.d || E.byCode(a.c.slug, b.c.slug))
+    .slice(0, 3)
+    .map(({ c }) => ({ slug: c.slug, name: c.name, symbol: c.symbol, category: c.category || 'Other', tvl_usd: c.tvl_usd, mcap_usd: c.mcap_usd, ratio: E.r2((c.mcap_usd ?? 0) / Math.max(1, c.tvl_usd)) }));
+}
+
+function computeRankIntervalsLocal(rows: { rank: number; implied_value_usd: number; ev_p25_usd: number; ev_p75_usd: number }[]) {
+  const evs = rows.map((r) => r.implied_value_usd);
+  return rows.map((r) => {
+    let betterThanHi = 0, betterThanLo = 0;
+    for (let j = 0; j < evs.length; j++) {
+      if (evs[j]! > r.ev_p75_usd) betterThanHi++;
+      if (evs[j]! > r.ev_p25_usd) betterThanLo++;
+    }
+    return { rank_lo: Math.min(r.rank, betterThanHi + 1), rank_hi: Math.max(r.rank, Math.min(rows.length, betterThanLo + 1)) };
+  });
 }
 
 export function serializeDataScript(radar: Record<string, unknown>): string {
