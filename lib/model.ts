@@ -227,6 +227,9 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
     launch_p75_usd: sc.launch_p75_usd,
     ev_p25_usd: sc.ev_p25_usd,
     ev_p75_usd: sc.ev_p75_usd,
+    eco_count: sc.eco_count,
+    cat_eb_mult: sc.cat_eb_mult,
+    chain_eb_mult: sc.chain_eb_mult,
     launch_odds: sc.launch_odds,
     category_asymp_rate: sc.category_asymp_rate,
     survival_remaining: sc.survival_remaining,
@@ -237,6 +240,7 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
     chain: fm.chain,
     chain_tier: fm.chain_tier,
     saved_vs_primary_usd: fm.saved_vs_primary_usd,
+    saved_vs_max_usd: fm.saved_vs_max_usd,
     net_ev_usd: fm.net_ev_usd,
     hourly_usd: fm.hourly_usd,
     total_gas_usd: fm.total_gas_usd,
@@ -259,7 +263,7 @@ export function buildRadar(snapshot: Snapshot): RadarOutput {
       mcap_usd: p.mcap_usd,
       change_7d: p.change_7d,
       age_days: E.ageDays(snapshot.as_of, p.listed_at),
-      predicted_mcap_usd: Math.round(Math.exp(val.alpha + val.beta * Math.log(p.tvl_usd))),
+      predicted_mcap_usd: E.predictStage1(p, val).launchMcap,
       ratio: E.r2((p.mcap_usd ?? 0) / Math.max(1, p.tvl_usd)),
     }))
     .sort((a: { mcap_usd: number; slug: string }, b: { mcap_usd: number; slug: string }) => b.mcap_usd - a.mcap_usd || E.byCode(a.slug, b.slug));
